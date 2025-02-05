@@ -8,15 +8,20 @@ from geometry_msgs.msg import PoseStamped
 
 
 class FeatureMatcher:
-    def __init__(self, feature_db_path, image_topic):
+    def __init__(self, feature_db_path, image_topic, pose_topic):
         self.feature_db_path = feature_db_path
         self.image_topic = image_topic
         self.features_database = []
         self.bridge = CvBridge()
-        self.orb = cv2.ORB_create()
+        self.orb = cv2.ORB_create(
+            nfeatures=1500,        # 提取的最大关键点数量 500
+            scaleFactor=1.1,       # 尺度空间因子 1.2
+            nlevels=12,            # 金字塔层级数量 8
+            edgeThreshold=15       # 边界阈值 31
+        )
         self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
         self.pose_publisher = rospy.Publisher(
-            "/matched_pose", PoseStamped, queue_size=10
+            pose_topic, PoseStamped, queue_size=10
         )
         self.load_feature_database()
 
@@ -38,7 +43,11 @@ class FeatureMatcher:
         try:
             # 将 ROS 图像消息转换为 OpenCV 图像
             new_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-            gray_image = cv2.cvtColor(new_image, cv2.COLOR_BGR2GRAY)
+            # Crop the image: remove 250 pixels from both left and right sides
+            height, width, _ = new_image.shape
+            if width > 500:  # Ensure the image is wide enough to crop
+                cropped_image = new_image[:, 150:width-150]
+            gray_image = cv2.cvtColor(cropped_image, cv2.COLOR_BGR2GRAY)
 
             # 提取实时图像特征
             keypoints, descriptors = self.orb.detectAndCompute(gray_image, None)
@@ -52,6 +61,7 @@ class FeatureMatcher:
             # 进行匹配
             best_match = None
             min_distance = float("inf")
+            best_matches = []  # 保存最佳匹配的匹配点对
 
             for data in self.features_database:
                 if data["descriptors"] is None:
@@ -66,16 +76,18 @@ class FeatureMatcher:
                 if avg_distance < min_distance:
                     min_distance = avg_distance
                     best_match = data
+                    best_matches = matches
 
             if best_match:
                 rospy.loginfo(
                     f"Best matching image timestamp: {best_match['timestamp']}"
                 )
-                rospy.loginfo(f"Pose: {best_match['pose']}")
+                # rospy.loginfo(f"Pose: {best_match['pose']}")
 
                 # 发布 Pose 信息
                 pose_msg = PoseStamped()
-                pose_msg.header.stamp = rospy.Time.now()
+                # pose_msg.header.stamp = rospy.Time.now()
+                pose_msg.header.stamp = rospy.Time.from_sec(best_match["timestamp"])
                 pose_msg.header.frame_id = "map"
                 pose_msg.pose.position.x = best_match["pose"]["translation"][0]
                 pose_msg.pose.position.y = best_match["pose"]["translation"][1]
@@ -85,14 +97,23 @@ class FeatureMatcher:
                 pose_msg.pose.orientation.z = best_match["pose"]["rotation"][2]
                 pose_msg.pose.orientation.w = best_match["pose"]["rotation"][3]
                 self.pose_publisher.publish(pose_msg)
-                rospy.loginfo("Publish matching Pose information!")
+                # rospy.loginfo("Publish matching Pose information!")
 
-                # 可视化关键点
+                # 可视化关键点并标注匹配点
                 curr_image = cv2.drawKeypoints(
-                    new_image, keypoints, None, color=(0, 255, 0)
+                    cropped_image, keypoints, None, color=(0, 255, 0)
                 )
-                cv2.imshow("Keypoints for current picture", curr_image)
-                cv2.waitKey(1)
+
+                # 提取匹配的关键点对
+                matched_keypoints = [keypoints[m.queryIdx].pt for m in best_matches]
+
+                # 在图像上绘制红色圆圈表示匹配点
+                for point in matched_keypoints:
+                    cv2.circle(curr_image, (int(point[0]), int(point[1])), 5, (0, 0, 255), -1)
+
+                # 显示可视化结果
+                # cv2.imshow("Keypoints with Matches", curr_image)
+                # cv2.waitKey(1)
             else:
                 rospy.loginfo("No suitable matches found!")
 
@@ -110,7 +131,7 @@ if __name__ == "__main__":
 
     # 初始化 FeatureMatcher
     matcher = FeatureMatcher(
-        feature_db_path="features_database.pkl", image_topic="/usb_cam/image_raw"
+        feature_db_path="features_database.pkl", image_topic="/ricoh_camera/image_raw", pose_topic="/matched_pose"
     )
 
     # 启动匹配流程
